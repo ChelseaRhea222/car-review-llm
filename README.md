@@ -1,4 +1,4 @@
-# 🚗 LLM Car Review Summaries
+# LLM Car Review Summaries
 
 A lightweight NLP pipeline that cleans messy customer review CSV files and uses a small language model to automatically generate concise one-sentence summaries for each review.
 
@@ -83,3 +83,4 @@ python llm_car_review.py
 
 Chelsea Rhea
 Data Analytics & Engineering Portfolio
+
