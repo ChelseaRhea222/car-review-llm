@@ -1,5 +1,6 @@
 import os
 import re
+from collections import Counter
 import pandas as pd
 from transformers import pipeline
 
@@ -28,7 +29,7 @@ print("File size (bytes):", size)
 if size == 0:
     raise ValueError("car_reviews.csv is 0 bytes (empty). Re-export or re-download the file.")
 
-# ====== 1) READ RAW BYTES + DECODE SAFELY ======
+# ====== 1) READ RAW BYTES + DECODE ======
 raw = open(INPUT_PATH, "rb").read()
 print("First 80 bytes:", raw[:80])
 
@@ -92,39 +93,98 @@ if df.empty:
         "  <review text><delimiter><POSITIVE/NEGATIVE>"
     )
 
-# ====== 3) SUMMARIZE REVIEWS (SUPPORTED TASK: text-generation) ======
-# NOTE: This is not as strong as a true summarization model, but it WILL run
-# because your Transformers install supports 'text-generation'.
-generator = pipeline("text-generation", model="distilgpt2")
+# ====== 3) SUMMARIZE REVIEWS ======
+# Prefer a true summarization model; if unavailable, use an extractive fallback.
+summarizer = None
+try:
+    summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
+    print("Summarizer: sshleifer/distilbart-cnn-12-6")
+except Exception as e:
+    print("Summarization model unavailable, using extractive fallback.")
+    print("Reason:", str(e))
+
+STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "for",
+    "from", "had", "has", "have", "he", "her", "him", "his", "i", "if", "in",
+    "is", "it", "its", "me", "my", "of", "on", "or", "our", "she", "so",
+    "that", "the", "their", "them", "there", "they", "this", "to", "was",
+    "we", "were", "with", "you", "your"
+}
+
+def split_sentences(text: str):
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
+    return [p.strip() for p in parts if p and re.search(r"[A-Za-z0-9]", p)]
+
+def tokenize(text: str):
+    return [w for w in re.findall(r"[A-Za-z']+", text.lower()) if w not in STOPWORDS]
+
+def normalize_sentence(s: str) -> str:
+    s = re.sub(r"\s+", " ", s).strip()
+    if s and s[-1] not in ".!?":
+        s += "."
+    return s
+
+def extractive_summary(review_text: str) -> str:
+    sentences = split_sentences(review_text)
+    if not sentences:
+        return "Summary unavailable."
+    if len(sentences) == 1:
+        return normalize_sentence(sentences[0])
+
+    doc_tokens = tokenize(review_text)
+    freqs = Counter(doc_tokens)
+
+    best_score = float("-inf")
+    best_sentence = sentences[0]
+
+    for idx, sent in enumerate(sentences):
+        tokens = tokenize(sent)
+        if not tokens:
+            continue
+
+        keyword_score = sum(freqs[t] for t in tokens) / max(len(tokens), 1)
+        length = len(sent.split())
+        # Favor moderately detailed sentences over very short/generic ones.
+        length_bonus = 0.0
+        if 10 <= length <= 28:
+            length_bonus = 1.5
+        elif 7 <= length < 10 or 29 <= length <= 35:
+            length_bonus = 0.7
+        elif length < 5:
+            length_bonus = -1.5
+
+        # Small penalty for first sentence to reduce "just copy first line".
+        position_penalty = -0.35 if idx == 0 else 0.0
+        score = keyword_score + length_bonus + position_penalty
+
+        if score > best_score:
+            best_score = score
+            best_sentence = sent
+
+    return normalize_sentence(best_sentence)
 
 def summarize_one(review_text: str) -> str:
-    prompt = (
-        "Write a single-sentence summary of this car review. "
-        "Do not add extra commentary.\n"
-        f"Review: {review_text}\n"
-        "Summary:"
-    )
+    review_text = re.sub(r"\s+", " ", str(review_text)).strip()
+    if not review_text:
+        return "Summary unavailable."
 
-    out = generator(
-        prompt,
-        max_new_tokens=35,
-        do_sample=False,
-        num_return_sequences=1,
-        pad_token_id=50256
-    )[0]["generated_text"]
+    if summarizer is not None:
+        try:
+            out = summarizer(
+                review_text,
+                max_length=48,
+                min_length=16,
+                do_sample=False,
+                truncation=True
+            )[0]["summary_text"]
+            out = normalize_sentence(out)
+            # Guardrail for obvious low-quality generations.
+            if len(out.split()) >= 5 and "i am a very good car" not in out.lower():
+                return out
+        except Exception:
+            pass
 
-    # Grab text after "Summary:"
-    summary = out.split("Summary:", 1)[-1].strip()
-
-    # Keep it to one sentence (basic cleanup)
-    if "." in summary:
-        summary = summary.split(".", 1)[0].strip() + "."
-
-    # Fallback if model returns nothing useful
-    if len(summary) < 5:
-        summary = "Summary unavailable."
-
-    return summary
+    return extractive_summary(review_text)
 
 df["Summary"] = [summarize_one(r) for r in df["Review"].tolist()]
 
